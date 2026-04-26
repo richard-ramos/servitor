@@ -66,6 +66,9 @@ func run() error {
 		redactor: redactor,
 		runner:   runner,
 	}
+	if err := app.SyncTelegramCommands(ctx); err != nil {
+		fmt.Printf("telegram command sync error: %s\n", redactor.Redact(err.Error()))
+	}
 	go app.RunQueueLoop(ctx)
 	go app.RunSchedulerLoop(ctx)
 	return app.PollLoop(ctx)

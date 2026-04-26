@@ -11,7 +11,8 @@ RUN useradd -m -s /bin/bash agent
 COPY scripts/agent-entrypoint.sh /usr/local/bin/agent-entrypoint.sh
 COPY scripts/servitor-send /usr/local/bin/servitor-send
 COPY scripts/servitor-send-file /usr/local/bin/servitor-send-file
-RUN chmod 0755 /usr/local/bin/agent-entrypoint.sh /usr/local/bin/servitor-send /usr/local/bin/servitor-send-file
+COPY scripts/servitor-action /usr/local/bin/servitor-action
+RUN chmod 0755 /usr/local/bin/agent-entrypoint.sh /usr/local/bin/servitor-send /usr/local/bin/servitor-send-file /usr/local/bin/servitor-action
 
 USER agent
 WORKDIR /home/agent/workspace

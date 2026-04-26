@@ -30,18 +30,143 @@ func (a *App) runDueSchedules(ctx context.Context) error {
 		return err
 	}
 	for _, s := range due {
-		if _, err := Enqueue(ctx, a.db, s.ContextID, 0, 0, s.Prompt, false); err != nil {
+		prompt := schedulePrompt(s)
+		if _, err := EnqueueForSchedule(ctx, a.db, s.ContextID, s.ID, 0, 0, prompt, false); err != nil {
 			return err
 		}
-		next, err := NextCronTime(s.CronExpr, now.Add(time.Minute), a.cfg.ServiceTimezone)
+		next, status, err := a.nextScheduleAfterRun(s, now)
 		if err != nil {
 			return err
 		}
-		if err := UpdateScheduleAfterRun(ctx, a.db, s.ID, now, next); err != nil {
+		if err := UpdateScheduleAfterRun(ctx, a.db, s.ID, now, next, status); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func schedulePrompt(s Schedule) string {
+	if s.ScriptPath == "" {
+		return s.Prompt
+	}
+	prompt := strings.TrimSpace(s.Prompt)
+	if prompt == "" {
+		prompt = "Run or follow the scheduled workspace script."
+	}
+	return fmt.Sprintf("Scheduled task script: /home/agent/workspace/%s\n\n%s", filepathToSlash(s.ScriptPath), prompt)
+}
+
+func filepathToSlash(path string) string {
+	return strings.ReplaceAll(path, "\\", "/")
+}
+
+func (a *App) nextScheduleAfterRun(s Schedule, now time.Time) (*time.Time, string, error) {
+	switch s.Kind {
+	case ScheduleKindCron, "":
+		next, err := NextCronTime(s.CronExpr, now, a.cfg.ServiceTimezone)
+		if err != nil {
+			return nil, "", err
+		}
+		return &next, ScheduleStatusActive, nil
+	case ScheduleKindInterval:
+		if s.IntervalSeconds <= 0 {
+			return nil, "", fmt.Errorf("invalid interval schedule")
+		}
+		next := now.Add(time.Duration(s.IntervalSeconds) * time.Second)
+		return &next, ScheduleStatusActive, nil
+	case ScheduleKindOnce:
+		return nil, ScheduleStatusCompleted, nil
+	default:
+		return nil, "", fmt.Errorf("unsupported schedule kind %q", s.Kind)
+	}
+}
+
+func InitialNextRun(kind, spec string, loc *time.Location) (Schedule, error) {
+	now := time.Now().In(loc)
+	var s Schedule
+	s.Kind = kind
+	s.Status = ScheduleStatusActive
+	s.Enabled = true
+	switch kind {
+	case ScheduleKindCron:
+		next, err := NextCronTime(spec, now, loc)
+		if err != nil {
+			return s, err
+		}
+		s.CronExpr = spec
+		s.NextRunAt = next
+	case ScheduleKindInterval:
+		d, err := ParseTaskDuration(spec)
+		if err != nil {
+			return s, err
+		}
+		s.IntervalSeconds = int64(d.Seconds())
+		s.NextRunAt = now.Add(d)
+	case ScheduleKindOnce:
+		runAt, err := ParseTaskTime(spec, loc)
+		if err != nil {
+			return s, err
+		}
+		if !runAt.After(now) {
+			return s, fmt.Errorf("one-shot time must be in the future")
+		}
+		s.RunAt = &runAt
+		s.NextRunAt = runAt
+	default:
+		return s, fmt.Errorf("unsupported schedule kind %q", kind)
+	}
+	return s, nil
+}
+
+func recomputeNextRun(s Schedule, loc *time.Location) (time.Time, error) {
+	switch s.Kind {
+	case ScheduleKindCron, "":
+		return NextCronTime(s.CronExpr, time.Now().In(loc), loc)
+	case ScheduleKindInterval:
+		if s.IntervalSeconds <= 0 {
+			return time.Time{}, fmt.Errorf("invalid interval schedule")
+		}
+		return time.Now().In(loc).Add(time.Duration(s.IntervalSeconds) * time.Second), nil
+	case ScheduleKindOnce:
+		if s.RunAt == nil {
+			return time.Time{}, fmt.Errorf("one-shot schedule has no run time")
+		}
+		if !s.RunAt.After(time.Now().In(loc)) {
+			return time.Time{}, fmt.Errorf("one-shot schedule time is in the past")
+		}
+		return *s.RunAt, nil
+	default:
+		return time.Time{}, fmt.Errorf("unsupported schedule kind %q", s.Kind)
+	}
+}
+
+func ParseTaskDuration(spec string) (time.Duration, error) {
+	spec = strings.TrimSpace(spec)
+	if strings.HasSuffix(spec, "d") {
+		n, err := strconv.Atoi(strings.TrimSuffix(spec, "d"))
+		if err != nil || n <= 0 {
+			return 0, fmt.Errorf("invalid duration %q", spec)
+		}
+		return time.Duration(n) * 24 * time.Hour, nil
+	}
+	d, err := time.ParseDuration(spec)
+	if err != nil {
+		return 0, err
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("duration must be positive")
+	}
+	return d, nil
+}
+
+func ParseTaskTime(spec string, loc *time.Location) (time.Time, error) {
+	spec = strings.TrimSpace(spec)
+	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04", "2006-01-02T15:04:05", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, spec, loc); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("expected RFC3339 or local time like 2026-04-25T15:04")
 }
 
 type cronSpec struct {
@@ -142,9 +267,21 @@ func parseCronField(field string, min, max int) (map[int]bool, error) {
 }
 
 func (s cronSpec) matches(t time.Time) bool {
+	domStar := len(s.dom) == 31
+	dowStar := len(s.dow) == 7
+	dayMatches := false
+	switch {
+	case domStar && dowStar:
+		dayMatches = true
+	case domStar:
+		dayMatches = s.dow[int(t.Weekday())]
+	case dowStar:
+		dayMatches = s.dom[t.Day()]
+	default:
+		dayMatches = s.dom[t.Day()] || s.dow[int(t.Weekday())]
+	}
 	return s.minute[t.Minute()] &&
 		s.hour[t.Hour()] &&
-		s.dom[t.Day()] &&
-		s.month[int(t.Month())] &&
-		s.dow[int(t.Weekday())]
+		dayMatches &&
+		s.month[int(t.Month())]
 }

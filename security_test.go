@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +25,23 @@ func TestValidateContextPathRejectsEscape(t *testing.T) {
 	}
 	if _, err := ValidateContextPath(cfg, "ctx", filepath.Join(ctxDir, "..")); err == nil {
 		t.Fatal("expected escape rejection")
+	}
+}
+
+func TestValidateContextPathDoesNotCreateOutsideDirectory(t *testing.T) {
+	root := t.TempDir()
+	cfg := Config{DataDir: root}
+	ctxDir := ContextDir(cfg, "ctx")
+	if err := os.MkdirAll(ctxDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "..", "outside-servitor-test")
+	_ = os.RemoveAll(outside)
+	if _, err := ValidateContextPath(cfg, "ctx", filepath.Join(outside, "nested")); err == nil {
+		t.Fatal("expected escape rejection")
+	}
+	if _, err := os.Stat(outside); !os.IsNotExist(err) {
+		t.Fatalf("outside directory was created or stat failed: %v", err)
 	}
 }
 
@@ -80,5 +98,11 @@ func TestResolveWorkspaceFileRejectsSymlinkEscape(t *testing.T) {
 	}
 	if _, err := ResolveWorkspaceFile(cfg, "ctx", "link.txt", 100); err == nil {
 		t.Fatal("expected symlink escape rejection")
+	}
+}
+
+func TestIsPublicIPRejectsPrivate(t *testing.T) {
+	if isPublicIP(net.ParseIP("127.0.0.1")) || isPublicIP(net.ParseIP("10.0.0.1")) {
+		t.Fatal("expected loopback/private IP rejection")
 	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 var safeFilenameRE = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
@@ -39,12 +41,34 @@ func ContextRunsDir(cfg Config, contextID string) string {
 }
 
 func ValidateContextPath(cfg Config, contextID, p string) (string, error) {
-	if strings.ContainsRune(p, 0) || strings.Contains(p, "..") || strings.Contains(p, ":") || strings.Contains(p, ",") {
+	if strings.ContainsRune(p, 0) || strings.Contains(p, ":") || strings.Contains(p, ",") {
 		return "", fmt.Errorf("unsafe path fragment")
 	}
 	abs, err := filepath.Abs(p)
 	if err != nil {
 		return "", err
+	}
+	rootAbs, err := filepath.Abs(ContextDir(cfg, contextID))
+	if err != nil {
+		return "", err
+	}
+	if !isPathWithin(rootAbs, abs) {
+		return "", fmt.Errorf("path escapes context root: %s", p)
+	}
+	root, err := filepath.EvalSymlinks(rootAbs)
+	if err != nil {
+		return "", err
+	}
+	ancestor, err := existingAncestor(abs)
+	if err != nil {
+		return "", err
+	}
+	resolvedAncestor, err := filepath.EvalSymlinks(ancestor)
+	if err != nil {
+		return "", err
+	}
+	if !isPathWithin(root, resolvedAncestor) {
+		return "", fmt.Errorf("path escapes context root: %s", p)
 	}
 	if err := os.MkdirAll(abs, 0o700); err != nil {
 		return "", err
@@ -53,18 +77,10 @@ func ValidateContextPath(cfg Config, contextID, p string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	root, err := filepath.EvalSymlinks(ContextDir(cfg, contextID))
-	if err != nil {
-		return "", err
+	if !isPathWithin(root, resolved) {
+		return "", fmt.Errorf("path escapes context root: %s", p)
 	}
-	rel, err := filepath.Rel(root, resolved)
-	if err != nil {
-		return "", err
-	}
-	if rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel)) {
-		return resolved, nil
-	}
-	return "", fmt.Errorf("path escapes context root: %s", p)
+	return resolved, nil
 }
 
 func ValidateMountTarget(target string) error {
@@ -159,9 +175,58 @@ func ValidatePublicHTTPSRepo(raw string) error {
 		return fmt.Errorf("repo URL host is not public")
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+		if !isPublicIP(ip) {
 			return fmt.Errorf("repo URL host is not public")
+		}
+		return nil
+	}
+	lookupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
+	if err != nil {
+		return fmt.Errorf("repo URL host DNS lookup failed: %w", err)
+	}
+	if len(addrs) == 0 {
+		return fmt.Errorf("repo URL host has no DNS addresses")
+	}
+	for _, addr := range addrs {
+		if !isPublicIP(addr.IP) {
+			return fmt.Errorf("repo URL host resolves to non-public address")
 		}
 	}
 	return nil
+}
+
+func existingAncestor(path string) (string, error) {
+	cur := path
+	for {
+		if _, err := os.Lstat(cur); err == nil {
+			return cur, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		next := filepath.Dir(cur)
+		if next == cur {
+			return "", fmt.Errorf("no existing ancestor for %s", path)
+		}
+		cur = next
+	}
+}
+
+func isPathWithin(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (!strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && rel != ".." && !filepath.IsAbs(rel))
+}
+
+func isPublicIP(ip net.IP) bool {
+	return ip != nil &&
+		!ip.IsPrivate() &&
+		!ip.IsLoopback() &&
+		!ip.IsLinkLocalUnicast() &&
+		!ip.IsLinkLocalMulticast() &&
+		!ip.IsMulticast() &&
+		!ip.IsUnspecified()
 }

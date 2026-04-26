@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -37,9 +38,15 @@ type tgResponse[T any] struct {
 	Result      T      `json:"result"`
 }
 
+type TelegramBotCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
 type Update struct {
-	UpdateID int             `json:"update_id"`
-	Message  TelegramMessage `json:"message"`
+	UpdateID      int                    `json:"update_id"`
+	Message       TelegramMessage        `json:"message"`
+	CallbackQuery *TelegramCallbackQuery `json:"callback_query"`
 }
 
 type TelegramMessage struct {
@@ -96,10 +103,31 @@ type TelegramFileInfo struct {
 	FilePath     string `json:"file_path"`
 }
 
+type TelegramCallbackQuery struct {
+	ID      string          `json:"id"`
+	From    TelegramUser    `json:"from"`
+	Message TelegramMessage `json:"message"`
+	Data    string          `json:"data"`
+}
+
+type InlineKeyboardMarkup struct {
+	InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
+}
+
+type InlineKeyboardButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data"`
+}
+
+type reactionTypeEmoji struct {
+	Type  string `json:"type"`
+	Emoji string `json:"emoji"`
+}
+
 func (c *TelegramClient) GetUpdates(ctx context.Context, offset int) ([]Update, error) {
 	q := url.Values{}
 	q.Set("timeout", "30")
-	q.Set("allowed_updates", `["message"]`)
+	q.Set("allowed_updates", `["message","callback_query"]`)
 	if offset > 0 {
 		q.Set("offset", strconv.Itoa(offset))
 	}
@@ -136,6 +164,117 @@ func (c *TelegramClient) SendMessage(ctx context.Context, chatID int64, topicID 
 		sent = append(sent, resp.Result)
 	}
 	return sent, nil
+}
+
+func (c *TelegramClient) SendMessageWithInlineKeyboard(ctx context.Context, chatID int64, topicID int, text string, markup InlineKeyboardMarkup) (TelegramMessage, error) {
+	body := map[string]any{
+		"chat_id":      chatID,
+		"text":         text,
+		"reply_markup": markup,
+	}
+	if topicID != 0 {
+		body["message_thread_id"] = topicID
+	}
+	var resp tgResponse[TelegramMessage]
+	if err := c.postJSON(ctx, "sendMessage", body, &resp); err != nil {
+		return TelegramMessage{}, err
+	}
+	if !resp.OK {
+		return TelegramMessage{}, fmt.Errorf("telegram sendMessage: %s", resp.Description)
+	}
+	return resp.Result, nil
+}
+
+func (c *TelegramClient) EditMessageText(ctx context.Context, chatID int64, messageID int, text string, markup *InlineKeyboardMarkup) error {
+	body := map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+		"text":       text,
+	}
+	if markup != nil {
+		body["reply_markup"] = *markup
+	}
+	var resp tgResponse[json.RawMessage]
+	if err := c.postJSON(ctx, "editMessageText", body, &resp); err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("telegram editMessageText: %s", resp.Description)
+	}
+	return nil
+}
+
+func (c *TelegramClient) EditReplyMarkup(ctx context.Context, chatID int64, messageID int, markup *InlineKeyboardMarkup) error {
+	body := map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+	}
+	if markup != nil {
+		body["reply_markup"] = *markup
+	}
+	var resp tgResponse[json.RawMessage]
+	if err := c.postJSON(ctx, "editMessageReplyMarkup", body, &resp); err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("telegram editMessageReplyMarkup: %s", resp.Description)
+	}
+	return nil
+}
+
+func (c *TelegramClient) AnswerCallbackQuery(ctx context.Context, callbackID string, text string) error {
+	body := map[string]any{"callback_query_id": callbackID}
+	if text != "" {
+		body["text"] = text
+	}
+	var resp tgResponse[bool]
+	if err := c.postJSON(ctx, "answerCallbackQuery", body, &resp); err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("telegram answerCallbackQuery: %s", resp.Description)
+	}
+	return nil
+}
+
+func (c *TelegramClient) SetMessageReaction(ctx context.Context, chatID int64, messageID int, emoji string) error {
+	body := map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+		"reaction":   []reactionTypeEmoji{{Type: "emoji", Emoji: emoji}},
+		"is_big":     false,
+	}
+	var resp tgResponse[bool]
+	if err := c.postJSON(ctx, "setMessageReaction", body, &resp); err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("telegram setMessageReaction: %s", resp.Description)
+	}
+	return nil
+}
+
+func (c *TelegramClient) SetMyCommands(ctx context.Context, commands []TelegramBotCommand) error {
+	body := map[string]any{"commands": commands}
+	var resp tgResponse[bool]
+	if err := c.postJSON(ctx, "setMyCommands", body, &resp); err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("telegram setMyCommands: %s", resp.Description)
+	}
+	return nil
+}
+
+func (c *TelegramClient) GetMyCommands(ctx context.Context) ([]TelegramBotCommand, error) {
+	var resp tgResponse[[]TelegramBotCommand]
+	if err := c.get(ctx, "getMyCommands", nil, &resp); err != nil {
+		return nil, err
+	}
+	if !resp.OK {
+		return nil, fmt.Errorf("telegram getMyCommands: %s", resp.Description)
+	}
+	return resp.Result, nil
 }
 
 func (c *TelegramClient) SendDocument(ctx context.Context, chatID int64, topicID int, path string, caption string) (TelegramMessage, error) {
@@ -288,11 +427,14 @@ func TelegramSenderName(u TelegramUser) string {
 }
 
 type App struct {
-	cfg      Config
-	db       *sql.DB
-	tg       *TelegramClient
-	redactor *Redactor
-	runner   *DockerRunner
+	cfg           Config
+	db            *sql.DB
+	tg            *TelegramClient
+	redactor      *Redactor
+	runner        *DockerRunner
+	activeRunMu   sync.Mutex
+	activeRuns    map[int64]activeRun
+	activeContext map[string]int64
 }
 
 func (a *App) PollLoop(ctx context.Context) error {
@@ -331,6 +473,9 @@ func (a *App) HandleUpdate(ctx context.Context, upd Update) error {
 	if err := MarkSeen(ctx, a.db, upd.UpdateID); err != nil {
 		return err
 	}
+	if upd.CallbackQuery != nil && upd.CallbackQuery.ID != "" {
+		return a.handleCallbackQuery(ctx, upd)
+	}
 	msg := upd.Message
 	if msg.MessageID == 0 {
 		return nil
@@ -359,6 +504,12 @@ func (a *App) HandleUpdate(ctx context.Context, upd Update) error {
 		return nil
 	}
 	return a.dispatchMessage(ctx, msg, messageID)
+}
+
+func (a *App) reactQueued(ctx context.Context, msg TelegramMessage) {
+	if err := a.tg.SetMessageReaction(ctx, msg.Chat.ID, msg.MessageID, "👀"); err != nil {
+		fmt.Printf("queued reaction failed chat=%d msg=%d: %s\n", msg.Chat.ID, msg.MessageID, a.redactor.Redact(err.Error()))
+	}
 }
 
 func (a *App) reply(ctx context.Context, chatID int64, topicID int, text string) ([]TelegramMessage, error) {

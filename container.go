@@ -38,7 +38,7 @@ func (r *DockerRunner) BuildImage(ctx context.Context) error {
 	return nil
 }
 
-func (r *DockerRunner) Run(ctx context.Context, dbRunID int64, c Context, prompt string, resumeSession string, onAgentMessage AgentMessageHandler) RunResult {
+func (r *DockerRunner) Run(ctx context.Context, dbRunID int64, c Context, prompt string, resumeSession string, onAgentMessage AgentMessageHandler, onAgentAction AgentActionHandler) RunResult {
 	artifactDir := filepath.Join(ContextRunsDir(r.cfg, c.ID), fmt.Sprintf("%d", dbRunID))
 	result := RunResult{ArtifactDir: artifactDir, ContainerID: fmt.Sprintf("servitor-%d", dbRunID)}
 	if err := os.MkdirAll(artifactDir, 0o700); err != nil {
@@ -53,7 +53,7 @@ func (r *DockerRunner) Run(ctx context.Context, dbRunID int64, c Context, prompt
 		result.FailureClass = "artifact_setup"
 		return result
 	}
-	if err := writeCodexConfig(r.cfg, c.ID); err != nil {
+	if err := writeCodexConfig(r.cfg, c.ID, c.ReasoningEffort); err != nil {
 		result.ErrorText = err.Error()
 		result.FailureClass = "codex_config"
 		return result
@@ -96,6 +96,7 @@ func (r *DockerRunner) Run(ctx context.Context, dbRunID int64, c Context, prompt
 		"--cpus", "2",
 		"-e", "SERVITOR_CODEX_SESSION_ID=" + resumeSession,
 		"-e", "SERVITOR_AGENT_MESSAGES_FILE=/run-artifacts/agent_messages.jsonl",
+		"-e", "SERVITOR_AGENT_ACTIONS_FILE=/run-artifacts/agent_actions.jsonl",
 		"-e", fmt.Sprintf("SERVITOR_AGENT_MESSAGE_MAX_CHARS=%d", r.cfg.AgentMessageMaxChars),
 		"-e", fmt.Sprintf("SERVITOR_AGENT_MESSAGE_MAX_COUNT=%d", r.cfg.AgentMessageMaxPerRun),
 	}
@@ -113,6 +114,7 @@ func (r *DockerRunner) Run(ctx context.Context, dbRunID int64, c Context, prompt
 	)
 	cmd := exec.CommandContext(runCtx, "docker", args...)
 	responsePath := filepath.Join(artifactDir, "response.jsonl")
+	result.ResponsePath = responsePath
 	stderrPath := filepath.Join(artifactDir, "stderr.log")
 	result.StderrPath = stderrPath
 	result.LastMessagePath = filepath.Join(artifactDir, "last_message.txt")
@@ -138,9 +140,15 @@ func (r *DockerRunner) Run(ctx context.Context, dbRunID int64, c Context, prompt
 		defer close(agentMessagesDone)
 		r.monitorAgentMessages(runCtx, ctx, filepath.Join(artifactDir, "agent_messages.jsonl"), onAgentMessage)
 	}()
+	agentActionsDone := make(chan struct{})
+	go func() {
+		defer close(agentActionsDone)
+		r.monitorAgentActions(runCtx, ctx, filepath.Join(artifactDir, "agent_actions.jsonl"), onAgentAction)
+	}()
 	err = cmd.Wait()
 	cancel()
 	<-agentMessagesDone
+	<-agentActionsDone
 	sanitizedStderr := r.redactor.Redact(stderr.String())
 	if err == nil {
 		sanitizedStderr = filterSuccessfulRunStderr(sanitizedStderr)
@@ -155,7 +163,12 @@ func (r *DockerRunner) Run(ctx context.Context, dbRunID int64, c Context, prompt
 	if err != nil {
 		result.ErrorText = r.redactor.Redact(err.Error())
 		result.ExitCode = exitCode(err)
-		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+		if errors.Is(runCtx.Err(), context.Canceled) {
+			result.ErrorText = "run cancelled"
+			result.FailureClass = "cancelled"
+			result.Retryable = false
+			result.Canceled = true
+		} else if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 			result.FailureClass = "timeout"
 			result.Retryable = false
 		} else if strings.Contains(sanitizedStderr, "Error loading config.toml") {

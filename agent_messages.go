@@ -59,10 +59,7 @@ func (r *DockerRunner) processAgentMessageFile(ctx context.Context, path, auditP
 		return
 	}
 	text := string(data)
-	lines := strings.Split(text, "\n")
-	if !strings.HasSuffix(text, "\n") && len(lines) > 0 {
-		lines = lines[:len(lines)-1]
-	}
+	lines := completeJSONLLines(text)
 	for *processed < len(lines) {
 		line := strings.TrimSpace(lines[*processed])
 		*processed++
@@ -88,6 +85,16 @@ func (r *DockerRunner) processAgentMessageFile(ctx context.Context, path, auditP
 			*accepted++
 		}
 	}
+}
+
+func completeJSONLLines(text string) []string {
+	lines := strings.Split(text, "\n")
+	if len(lines) == 0 {
+		return nil
+	}
+	// Drop the trailing empty segment for newline-terminated files, or the
+	// trailing partial segment if the writer is mid-line.
+	return lines[:len(lines)-1]
 }
 
 func (r *DockerRunner) validateAgentMessage(msg AgentMessage, accepted int) (AgentMessage, string, bool) {

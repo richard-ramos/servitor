@@ -37,6 +37,9 @@ func BuildPrompt(ctx context.Context, db *sql.DB, cfg Config, c Context, chatID 
 		b.WriteString(instruction)
 		b.WriteString("\n")
 	}
+	b.WriteString("Controlled host action tool:\n")
+	b.WriteString(agentActionInstruction())
+	b.WriteString("\n")
 	if instructions, err := os.ReadFile(filepath.Join(ContextDir(cfg, c.ID), "instructions.md")); err == nil && len(strings.TrimSpace(string(instructions))) > 0 {
 		b.WriteString("Context instructions:\n")
 		b.WriteString(strings.TrimSpace(string(instructions)))
@@ -51,7 +54,11 @@ func BuildPrompt(ctx context.Context, db *sql.DB, cfg Config, c Context, chatID 
 		if body == "" {
 			body = "(attachment or empty message)"
 		}
-		b.WriteString(fmt.Sprintf("[%s msg:%d] %s: %s\n", m.CreatedAt.Format("2006-01-02 15:04"), m.TelegramMessageID, m.SenderName, body))
+		trust := ""
+		if !m.IsAdmin && !m.IsBot {
+			trust = " [UNTRUSTED non-admin]"
+		}
+		b.WriteString(fmt.Sprintf("[%s msg:%d%s] %s: %s\n", m.CreatedAt.Format("2006-01-02 15:04"), m.TelegramMessageID, trust, m.SenderName, body))
 		for _, a := range attachments[m.ID] {
 			b.WriteString(fmt.Sprintf("  attachment: /home/agent/workspace/%s", filepath.ToSlash(a.WorkspaceRelPath)))
 			if a.OriginalFilename != "" {

@@ -24,6 +24,7 @@ type Config struct {
 	CodexAuthRefreshIntervalSeconds int
 	OpenAIAPIKey                    string
 	OpenAIProxyHost                 string
+	OpenAIProxyBindHost             string
 	OpenAIProxyPort                 int
 	OpenAIProxyClientToken          string
 	OpenAIUpstreamBaseURL           string
@@ -46,6 +47,39 @@ type Config struct {
 	ServiceTimezone                 *time.Location
 	ContainerImage                  string
 	SkipDockerBuild                 bool
+	SkillsDir                       string
+	AgentsFile                      string
+}
+
+const defaultReasoningEffort = "xhigh"
+
+func normalizeReasoningEffort(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "low":
+		return "low", true
+	case "medium":
+		return "medium", true
+	case "high":
+		return "high", true
+	case "xhigh":
+		return "xhigh", true
+	default:
+		return "", false
+	}
+}
+
+func reasoningEffortChoices() string {
+	return "low, medium, high, xhigh"
+}
+
+func effectiveReasoningEffort(cfg Config, value string) string {
+	if effort, ok := normalizeReasoningEffort(value); ok {
+		return effort
+	}
+	if effort, ok := normalizeReasoningEffort(cfg.DefaultReasoningEffort); ok {
+		return effort
+	}
+	return defaultReasoningEffort
 }
 
 func LoadConfig() (Config, error) {
@@ -73,6 +107,10 @@ func LoadConfig() (Config, error) {
 	if _, err := url.ParseRequestURI(chatGPTUpstream); err != nil {
 		return Config{}, fmt.Errorf("invalid CHATGPT_CODEX_UPSTREAM_BASE_URL: %w", err)
 	}
+	defaultEffort, ok := normalizeReasoningEffort(envString("DEFAULT_REASONING_EFFORT", defaultReasoningEffort))
+	if !ok {
+		return Config{}, fmt.Errorf("invalid DEFAULT_REASONING_EFFORT: must be one of %s", reasoningEffortChoices())
+	}
 	cfg := Config{
 		TelegramBotToken:                os.Getenv("TELEGRAM_BOT_TOKEN"),
 		CodexAuthMode:                   authMode,
@@ -80,12 +118,13 @@ func LoadConfig() (Config, error) {
 		CodexAuthRefreshIntervalSeconds: envInt("CODEX_AUTH_REFRESH_INTERVAL_SECONDS", 300),
 		OpenAIAPIKey:                    os.Getenv("OPENAI_API_KEY"),
 		OpenAIProxyHost:                 envString("OPENAI_PROXY_HOST", "127.0.0.1"),
+		OpenAIProxyBindHost:             envString("OPENAI_PROXY_BIND_HOST", ""),
 		OpenAIProxyPort:                 envInt("OPENAI_PROXY_PORT", 3021),
 		OpenAIProxyClientToken:          proxyClientToken,
 		OpenAIUpstreamBaseURL:           upstream,
 		ChatGPTCodexUpstreamBaseURL:     chatGPTUpstream,
 		DefaultCodexModel:               envString("DEFAULT_CODEX_MODEL", "gpt-5.4-mini"),
-		DefaultReasoningEffort:          envString("DEFAULT_REASONING_EFFORT", "medium"),
+		DefaultReasoningEffort:          defaultEffort,
 		DataDir:                         absDataDir,
 		AdminUserIDs:                    parseAdminIDs(os.Getenv("ADMIN_USER_IDS")),
 		MaxConcurrentContainers:         envInt("MAX_CONCURRENT_CONTAINERS", 3),
@@ -93,7 +132,7 @@ func LoadConfig() (Config, error) {
 		MaxOutputBytes:                  int64(envInt("MAX_OUTPUT_BYTES", 200000)),
 		MaxHistoryMessages:              envInt("MAX_HISTORY_MESSAGES", 20),
 		MaxAttachmentBytes:              int64(envInt("MAX_ATTACHMENT_BYTES", 25000000)),
-		ProgressUpdates:                 envBool("PROGRESS_UPDATES", false),
+		ProgressUpdates:                 envBool("PROGRESS_UPDATES", true),
 		ProgressIntervalSeconds:         envInt("PROGRESS_INTERVAL_SECONDS", 300),
 		AgentMessagesEnabled:            envBool("AGENT_MESSAGES_ENABLED", true),
 		AgentMessageMaxPerRun:           envInt("AGENT_MESSAGE_MAX_PER_RUN", 5),
@@ -102,6 +141,8 @@ func LoadConfig() (Config, error) {
 		ServiceTimezone:                 loc,
 		ContainerImage:                  envString("CONTAINER_IMAGE", "servitor-agent:latest"),
 		SkipDockerBuild:                 envBool("SERVITOR_SKIP_DOCKER_BUILD", false),
+		SkillsDir:                       envString("SKILLS_DIR", filepath.Join(envString("CODEX_HOST_AUTH_DIR", "~/.codex"), "skills")),
+		AgentsFile:                      envString("AGENTS_FILE", filepath.Join(envString("CODEX_HOST_AUTH_DIR", "~/.codex"), "AGENTS.md")),
 	}
 	if cfg.MaxConcurrentContainers < 1 {
 		cfg.MaxConcurrentContainers = 1
@@ -125,12 +166,14 @@ func LoadConfig() (Config, error) {
 }
 
 func (c Config) ProxyListenAddr() string {
-	host := c.OpenAIProxyHost
-	if host == "127.0.0.1" || host == "localhost" || host == "::1" {
-		// Docker bridge containers reach the host through host.docker.internal,
-		// not the host's loopback interface. The proxy still requires the
-		// per-process placeholder bearer token before injecting real auth.
-		host = "0.0.0.0"
+	host := strings.TrimSpace(c.OpenAIProxyBindHost)
+	if host == "" {
+		host = c.OpenAIProxyHost
+		if isLoopbackHost(host) {
+			if bridge := dockerBridgeBindHost(); bridge != "" {
+				host = bridge
+			}
+		}
 	}
 	return net.JoinHostPort(host, strconv.Itoa(c.OpenAIProxyPort))
 }
@@ -167,7 +210,39 @@ func (c Config) ValidateForRun() error {
 	if len(missing) > 0 {
 		return fmt.Errorf("missing required config: %s", strings.Join(missing, ", "))
 	}
+	if isLoopbackHost(c.OpenAIProxyHost) && c.OpenAIProxyBindHost == "" && dockerBridgeBindHost() == "" {
+		return fmt.Errorf("OPENAI_PROXY_BIND_HOST is required because OPENAI_PROXY_HOST=%q is loopback and no docker bridge address was detected", c.OpenAIProxyHost)
+	}
 	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.Trim(host, "[]")
+	return host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
+func dockerBridgeBindHost() string {
+	iface, err := net.InterfaceByName("docker0")
+	if err != nil {
+		return ""
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return ""
+	}
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip4 := ip.To4(); ip4 != nil && !ip4.IsLoopback() {
+			return ip4.String()
+		}
+	}
+	return ""
 }
 
 func loadDotEnv(path string) error {

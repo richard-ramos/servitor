@@ -14,17 +14,29 @@ const (
 	QueueStatusRunning = "running"
 	QueueStatusDone    = "done"
 	QueueStatusFailed  = "failed"
+
+	ScheduleKindCron     = "cron"
+	ScheduleKindInterval = "interval"
+	ScheduleKindOnce     = "once"
+
+	ScheduleStatusActive    = "active"
+	ScheduleStatusPaused    = "paused"
+	ScheduleStatusCancelled = "cancelled"
+	ScheduleStatusCompleted = "completed"
 )
 
 type Context struct {
-	ID           string
-	Kind         string
-	State        string
-	RepoURL      string
-	WorkspaceDir string
-	CodexSession string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID              string
+	DisplayName     string
+	Kind            string
+	State           string
+	RepoURL         string
+	WorkspaceDir    string
+	CodexSession    string
+	AgentsEnabled   bool
+	ReasoningEffort string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type TopicBinding struct {
@@ -64,6 +76,7 @@ type Attachment struct {
 type QueueItem struct {
 	ID                int64
 	ContextID         string
+	ScheduleID        string
 	MessageID         int64
 	TelegramMessageID int
 	Prompt            string
@@ -93,20 +106,27 @@ type Run struct {
 }
 
 type Schedule struct {
-	ID        string
-	ContextID string
-	CronExpr  string
-	Prompt    string
-	Enabled   bool
-	LastRunAt *time.Time
-	NextRunAt time.Time
-	CreatedAt time.Time
+	ID              string
+	ContextID       string
+	Kind            string
+	Status          string
+	CronExpr        string
+	IntervalSeconds int64
+	RunAt           *time.Time
+	ScriptPath      string
+	Prompt          string
+	Enabled         bool
+	LastRunAt       *time.Time
+	NextRunAt       time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type RunResult struct {
 	ExitCode        int
 	ContainerID     string
 	ArtifactDir     string
+	ResponsePath    string
 	StderrPath      string
 	LastMessagePath string
 	LastMessage     string
@@ -115,4 +135,56 @@ type RunResult struct {
 	FailureClass    string
 	Retryable       bool
 	StartedCodex    bool
+	Canceled        bool
+}
+
+type UsageRecord struct {
+	ID           int64
+	RunID        int64
+	QueueID      int64
+	ContextID    string
+	Model        string
+	InputTokens  int64
+	OutputTokens int64
+	TotalTokens  int64
+	RawJSON      string
+	CreatedAt    time.Time
+}
+
+type ScheduleRunHistory struct {
+	QueueID    int64
+	RunID      int64
+	Status     string
+	ExitCode   int
+	CreatedAt  time.Time
+	FinishedAt *time.Time
+}
+
+type OutboundAction struct {
+	ID                string
+	RunID             int64
+	ContextID         string
+	ChatID            int64
+	TopicID           int
+	SourceMessageID   int
+	Type              string
+	Ref               string
+	PayloadJSON       string
+	Status            string
+	TelegramMessageID int
+	RequiresAdmin     bool
+	CreatedAt         time.Time
+	ExpiresAt         *time.Time
+	CompletedAt       *time.Time
+}
+
+type OutboundActionEvent struct {
+	ID               int64
+	ActionID         string
+	TelegramUpdateID int
+	UserID           int64
+	Value            string
+	Accepted         bool
+	Reason           string
+	CreatedAt        time.Time
 }
